@@ -81,10 +81,21 @@ type DataBrokerReconciler struct {
 	DebugDumpConfigDiff bool
 	// RemoveUnreferencedCerts would strip any certs not matched by any of the Routes SNI
 	RemoveUnreferencedCerts bool
+	// ingressConfigCache avoids rebuilding the monolithic Pomerium config for
+	// duplicate Kubernetes events. The zero value is ready for use.
+	ingressConfigCache ingressConfigCache
 }
 
 // Upsert should update or create the pomerium routes corresponding to this ingress
 func (r *DataBrokerReconciler) Upsert(ctx context.Context, ic *model.IngressConfig) (bool, error) {
+	fingerprint, err := fingerprintIngressConfig(ic)
+	if err != nil {
+		return false, fmt.Errorf("fingerprint ingress config: %w", err)
+	}
+	if r.ingressConfigCache.hit(ic.GetIngressNamespacedName(), fingerprint) {
+		return false, nil
+	}
+
 	prev, err := r.getConfig(ctx)
 	if err != nil {
 		return false, fmt.Errorf("get config: %w", err)
@@ -96,12 +107,20 @@ func (r *DataBrokerReconciler) Upsert(ctx context.Context, ic *model.IngressConf
 	}
 	addCerts(next, ic.Secrets)
 
-	return r.saveConfig(ctx, prev, next, fmt.Sprintf("%s-%s", r.ConfigID, ic.Ingress.UID))
+	changed, err := r.saveConfig(ctx, prev, next, fmt.Sprintf("%s-%s", r.ConfigID, ic.Ingress.UID))
+	if err == nil {
+		r.ingressConfigCache.store(ic.GetIngressNamespacedName(), fingerprint)
+	}
+	return changed, err
 }
 
 // Set merges existing config with the one generated for ingress
 func (r *DataBrokerReconciler) Set(ctx context.Context, ics []*model.IngressConfig) (bool, error) {
 	logger := log.FromContext(ctx)
+	fingerprints, err := fingerprintIngressConfigs(ics)
+	if err != nil {
+		return false, fmt.Errorf("fingerprint ingress configs: %w", err)
+	}
 
 	prev, err := r.getConfig(ctx)
 	if err != nil {
@@ -115,6 +134,7 @@ func (r *DataBrokerReconciler) Set(ctx context.Context, ics []*model.IngressConf
 
 	changed, err := r.saveConfig(ctx, prev, next, r.ConfigID)
 	if err == nil {
+		r.ingressConfigCache.replace(fingerprints)
 		return changed, nil
 	}
 
@@ -124,7 +144,11 @@ func (r *DataBrokerReconciler) Set(ctx context.Context, ics []*model.IngressConf
 	// only reached when a batch fails to validate as a whole.
 	logger.Error(err, "batch config validation failed; falling back to incremental validation to isolate invalid ingress(es)")
 	next = r.buildConfigIncremental(ctx, ics)
-	return r.saveConfig(ctx, prev, next, r.ConfigID)
+	changed, err = r.saveConfig(ctx, prev, next, r.ConfigID)
+	if err == nil {
+		r.ingressConfigCache.replace(fingerprints)
+	}
+	return changed, err
 }
 
 // buildConfigCheap merges the routes for all ingresses into a single config, using
@@ -198,6 +222,7 @@ func (r *DataBrokerReconciler) Delete(ctx context.Context, namespacedName types.
 	if err != nil {
 		return false, fmt.Errorf("updating pomerium config: %w", err)
 	}
+	r.ingressConfigCache.delete(namespacedName)
 	return changed, nil
 }
 
