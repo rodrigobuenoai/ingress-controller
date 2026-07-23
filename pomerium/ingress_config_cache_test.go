@@ -2,18 +2,57 @@ package pomerium
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
 	"github.com/pomerium/ingress-controller/model"
+	"github.com/pomerium/pomerium/pkg/grpc/databroker"
 )
+
+type cacheTestDataBrokerClient struct {
+	databroker.DataBrokerServiceClient
+	record *databroker.Record
+	get    int
+	put    int
+	putErr error
+}
+
+func (c *cacheTestDataBrokerClient) Get(
+	_ context.Context,
+	_ *databroker.GetRequest,
+	_ ...grpc.CallOption,
+) (*databroker.GetResponse, error) {
+	c.get++
+	if c.record == nil {
+		return nil, status.Error(codes.NotFound, "record not found")
+	}
+	return &databroker.GetResponse{Record: proto.Clone(c.record).(*databroker.Record)}, nil
+}
+
+func (c *cacheTestDataBrokerClient) Put(
+	_ context.Context,
+	req *databroker.PutRequest,
+	_ ...grpc.CallOption,
+) (*databroker.PutResponse, error) {
+	c.put++
+	if c.putErr != nil {
+		return nil, c.putErr
+	}
+	c.record = proto.Clone(req.Records[0]).(*databroker.Record)
+	return &databroker.PutResponse{Records: []*databroker.Record{c.record}}, nil
+}
 
 func cacheTestIngressConfig() *model.IngressConfig {
 	ic := validIngressConfig("app", "app.localhost.pomerium.io")
@@ -124,6 +163,54 @@ func TestIngressConfigCacheShortCircuitsDuplicateUpsert(t *testing.T) {
 	changed, err := r.Upsert(context.Background(), ic)
 	require.NoError(t, err)
 	assert.False(t, changed)
+}
+
+func TestIngressConfigCacheSetPrimesUpsert(t *testing.T) {
+	ctx := context.Background()
+	client := new(cacheTestDataBrokerClient)
+	r := &DataBrokerReconciler{
+		ConfigID:                IngressControllerConfigID,
+		DataBrokerServiceClient: client,
+	}
+
+	ic := cacheTestIngressConfig()
+	changed, err := r.Set(ctx, []*model.IngressConfig{ic})
+	require.NoError(t, err)
+	assert.True(t, changed)
+	assert.Equal(t, 1, client.get)
+	assert.Equal(t, 1, client.put)
+
+	duplicate := cacheTestIngressConfig()
+	duplicate.Ingress.ResourceVersion = "101"
+	duplicate.Ingress.Status.LoadBalancer.Ingress[0].IP = "192.0.2.2"
+	changed, err = r.Upsert(ctx, duplicate)
+	require.NoError(t, err)
+	assert.False(t, changed)
+	assert.Equal(t, 1, client.get, "duplicate Upsert should not read DataBroker")
+	assert.Equal(t, 1, client.put, "duplicate Upsert should not write DataBroker")
+
+	duplicate.Ingress.Spec.Rules[0].Host = "changed.localhost.pomerium.io"
+	changed, err = r.Upsert(ctx, duplicate)
+	require.NoError(t, err)
+	assert.True(t, changed)
+	assert.Equal(t, 2, client.get, "a config change should read DataBroker")
+	assert.Equal(t, 2, client.put, "a config change should write DataBroker")
+}
+
+func TestIngressConfigCacheDoesNotStoreFailedSet(t *testing.T) {
+	client := &cacheTestDataBrokerClient{putErr: errors.New("put failed")}
+	r := &DataBrokerReconciler{
+		ConfigID:                IngressControllerConfigID,
+		DataBrokerServiceClient: client,
+	}
+	ic := cacheTestIngressConfig()
+
+	_, err := r.Set(context.Background(), []*model.IngressConfig{ic})
+	require.ErrorContains(t, err, "put failed")
+
+	fingerprint, fingerprintErr := fingerprintIngressConfig(ic)
+	require.NoError(t, fingerprintErr)
+	assert.False(t, r.ingressConfigCache.hit(ic.GetIngressNamespacedName(), fingerprint))
 }
 
 func TestIngressConfigCacheReplaceAndDelete(t *testing.T) {
